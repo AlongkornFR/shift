@@ -23,7 +23,7 @@ import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/Confirm";
 import { createClient } from "@/lib/supabase/client";
 import type { VenueTable, VenueSpace, Reservation } from "@/lib/types";
-import { Plus, Pencil, Check, Trash2, X as XIcon, Move, Table2, ChevronDown, Image as ImageIcon, Upload, ZoomIn, ZoomOut, Maximize2 } from "lucide-react";
+import { Plus, Pencil, Check, Trash2, X as XIcon, Move, Table2, ChevronDown, Image as ImageIcon, Upload, ZoomIn, ZoomOut, Maximize2, Sparkles, Loader2 } from "lucide-react";
 import { haptic } from "@/lib/haptics";
 
 interface FloorPlanProps {
@@ -86,6 +86,13 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
   const [bgOpacity, setBgOpacity] = useState(0.4);
   const [uploadingBg, setUploadingBg] = useState(false);
   const bgInputRef = useRef<HTMLInputElement>(null);
+
+  // Auto-detect (Gemini vision) preview
+  type DetectedSpace = { name: string; zone: VenueSpace["zone"]; x: number; y: number; width: number; height: number };
+  type DetectedTable = { label: string; x: number; y: number; seats: number; shape: "round" | "square" | "rect" };
+  const [detecting, setDetecting] = useState(false);
+  const [detection, setDetection] = useState<{ spaces: DetectedSpace[]; tables: DetectedTable[] } | null>(null);
+  const [applyingDetection, setApplyingDetection] = useState(false);
 
   // View mode: pan + zoom via viewBox manipulation
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, w: VIEWBOX_W, h: VIEWBOX_H });
@@ -166,6 +173,157 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
   async function handleBgOpacityChange(next: number) {
     setBgOpacity(next);
     await supabase.from("settings").upsert({ key: "floor_plan_image_opacity", value: String(next), updated_at: new Date().toISOString() });
+  }
+
+  // ── Auto-detect tables + spaces (Gemini vision) ────────────
+  async function handleAutoDetect() {
+    if (!bgImageUrl) { toast.error("Importe d'abord une image"); return; }
+    setDetecting(true);
+    haptic("light");
+    try {
+      // Strip cache-buster from URL so fetch stays simple on the server
+      const cleanUrl = bgImageUrl.split("?")[0];
+      const res = await fetch("/api/analyze-floor-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: cleanUrl }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        console.error("Auto-detect failed", json);
+        toast.error(`${json?.error || "Détection échouée"}${json?.detail ? " — voir console" : ""}`);
+        haptic("error");
+        return;
+      }
+      if ((json.spaces?.length ?? 0) === 0 && (json.tables?.length ?? 0) === 0) {
+        toast.error("Rien détecté sur cette image");
+        haptic("error");
+        return;
+      }
+      setDetection({ spaces: json.spaces, tables: json.tables });
+      haptic("success");
+    } catch {
+      toast.error("Erreur réseau");
+      haptic("error");
+    } finally {
+      setDetecting(false);
+    }
+  }
+
+  async function applyDetection(
+    edited: {
+      spaces: { name: string; zone: string; x: number; y: number; width: number; height: number }[];
+      tables: { label: string; x: number; y: number; seats: number; shape: string }[];
+    },
+    opts: { replaceSpaces: boolean; replaceTables: boolean },
+  ) {
+    const validZones: VenueSpace["zone"][] = ["restaurant", "terrasse", "terrasse_couverte", "bar"];
+    const normZone = (z: string): VenueSpace["zone"] =>
+      (validZones as string[]).includes(z) ? (z as VenueSpace["zone"]) : "restaurant";
+    setApplyingDetection(true);
+    try {
+      // Optional wipe
+      if (opts.replaceSpaces) {
+        await supabase.from("venue_spaces").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      }
+      if (opts.replaceTables) {
+        await supabase.from("venue_tables").delete().neq("id", "__never__");
+      }
+
+      // Insert spaces first so tables can be attached
+      const spaceRows = edited.spaces.map((s, i) => ({
+        name: s.name,
+        zone: normZone(s.zone),
+        color:
+          s.zone === "terrasse" ? "#D4A04A" :
+          s.zone === "terrasse_couverte" ? "#B89070" :
+          s.zone === "bar" ? "#8B5A40" : "#C4785A",
+        x: Math.round(s.x * VIEWBOX_W),
+        y: Math.round(s.y * VIEWBOX_H),
+        width: Math.max(MIN_SPACE_W, Math.round(s.width * VIEWBOX_W)),
+        height: Math.max(MIN_SPACE_H, Math.round(s.height * VIEWBOX_H)),
+        sort_order: (opts.replaceSpaces ? 0 : spaces.length) + i,
+      }));
+      const { data: insertedSpaces, error: spErr } = await supabase
+        .from("venue_spaces")
+        .insert(spaceRows)
+        .select();
+      if (spErr) { toast.error("Erreur création espaces"); return; }
+
+      const existingIds = new Set(
+        (opts.replaceTables ? [] : localTables.map((t) => t.id)),
+      );
+      const nextSpaces: VenueSpace[] = (insertedSpaces as VenueSpace[]) || [];
+      const allSpaces = opts.replaceSpaces ? nextSpaces : [...spaces, ...nextSpaces];
+
+      // Map each detected table to the smallest containing space (if any)
+      function containingSpace(xPx: number, yPx: number): VenueSpace | null {
+        let best: VenueSpace | null = null;
+        let bestArea = Infinity;
+        for (const s of allSpaces) {
+          if (xPx >= s.x && xPx <= s.x + s.width && yPx >= s.y && yPx <= s.y + s.height) {
+            const a = s.width * s.height;
+            if (a < bestArea) { best = s; bestArea = a; }
+          }
+        }
+        return best;
+      }
+
+      const tableRows = edited.tables
+        .map((t, i) => {
+          let id = t.label.trim() || `T${i + 1}`;
+          if (existingIds.has(id)) {
+            let n = 1;
+            while (existingIds.has(`${id}_${n}`)) n++;
+            id = `${id}_${n}`;
+          }
+          existingIds.add(id);
+          const xPx = Math.round(t.x * VIEWBOX_W);
+          const yPx = Math.round(t.y * VIEWBOX_H);
+          const sp = containingSpace(xPx, yPx);
+          const seats = Math.max(1, Math.min(20, t.seats));
+          return {
+            id,
+            zone: (sp?.zone ?? "restaurant") as string,
+            capacity: seats,
+            max_capacity: seats,
+            table_type: t.shape === "round" ? "round" : "standard",
+            sort_order: (opts.replaceTables ? 0 : localTables.length) + i + 1,
+            x: xPx,
+            y: yPx,
+            space_id: sp?.id ?? null,
+            radius: Math.max(MIN_TABLE_RADIUS, Math.min(MAX_TABLE_RADIUS, 18 + seats * 2)),
+          };
+        });
+
+      if (tableRows.length > 0) {
+        const { data: insertedTables, error: tErr } = await supabase
+          .from("venue_tables")
+          .insert(tableRows)
+          .select();
+        if (tErr) { toast.error("Erreur création tables"); return; }
+        if (opts.replaceTables) {
+          setLocalTables((insertedTables as VenueTable[]) || []);
+        } else {
+          setLocalTables((prev) => [...prev, ...((insertedTables as VenueTable[]) || [])]);
+        }
+      } else if (opts.replaceTables) {
+        setLocalTables([]);
+      }
+
+      if (opts.replaceSpaces) {
+        setSpaces(nextSpaces);
+      } else {
+        setSpaces((prev) => [...prev, ...nextSpaces]);
+      }
+
+      toast.success(`${spaceRows.length} espace(s) · ${tableRows.length} table(s) ajouté(s)`);
+      haptic("success");
+      setDetection(null);
+      onTablesChanged?.();
+    } finally {
+      setApplyingDetection(false);
+    }
   }
 
   // ── Helpers ────────────────────────────────────────────────
@@ -350,13 +508,35 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
     };
   }
 
-  function onWheel(e: React.WheelEvent) {
-    if (editing) return;
-    e.preventDefault();
-    const p = svgPoint(e as unknown as React.PointerEvent);
-    const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-    zoomAt(p.x, p.y, currentZoom() * factor);
-  }
+  // Wheel must be attached natively with { passive: false } — React's
+  // synthetic onWheel is passive so preventDefault() is ignored & warns.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const handler = (e: WheelEvent) => {
+      if (editing) return;
+      e.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const scaleX = VIEWBOX_W / rect.width;
+      const scaleY = VIEWBOX_H / rect.height;
+      const px = (e.clientX - rect.left) * scaleX;
+      const py = (e.clientY - rect.top) * scaleY;
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      const curZ = VIEWBOX_W / viewBox.w;
+      const z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, curZ * factor));
+      const w = VIEWBOX_W / z;
+      const h = VIEWBOX_H / z;
+      const rx = (px - viewBox.x) / viewBox.w;
+      const ry = (py - viewBox.y) / viewBox.h;
+      let x = px - rx * w;
+      let y = py - ry * h;
+      x = Math.max(0, Math.min(VIEWBOX_W - w, x));
+      y = Math.max(0, Math.min(VIEWBOX_H - h, y));
+      setViewBox({ x, y, w, h });
+    };
+    svg.addEventListener("wheel", handler, { passive: false });
+    return () => svg.removeEventListener("wheel", handler);
+  }, [editing, viewBox]);
 
   function distance(a: { x: number; y: number }, b: { x: number; y: number }) {
     return Math.hypot(a.x - b.x, a.y - b.y);
@@ -564,6 +744,26 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
                 e.target.value = "";
               }}
             />
+            {bgImageUrl && (
+              <button
+                onClick={handleAutoDetect}
+                disabled={detecting}
+                style={{
+                  display: "flex", alignItems: "center", gap: 4,
+                  padding: "6px 10px", borderRadius: 8,
+                  background: detecting ? "var(--secondary-bg)" : "var(--terra-medium)",
+                  color: detecting ? "var(--text-secondary)" : "#fff",
+                  border: "none", cursor: detecting ? "default" : "pointer",
+                  fontSize: 12, fontWeight: 500,
+                  opacity: detecting ? 0.7 : 1,
+                }}
+                title="Analyse l'image avec l'IA pour détecter espaces + tables"
+              >
+                {detecting
+                  ? <><Loader2 size={12} className="animate-spin" /> Analyse…</>
+                  : <><Sparkles size={12} /> Détecter auto</>}
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -648,7 +848,6 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
           onPointerUp={onPointerUp}
           onPointerLeave={onPointerUp}
           onPointerCancel={onPointerUp}
-          onWheel={onWheel}
           style={{ display: "block", touchAction: "none", cursor: !editing && isZoomed ? "grab" : "default" }}
         >
           {/* Background template image (patron-uploaded tracing guide) */}
@@ -1039,6 +1238,281 @@ export default function FloorPlan({ tables, reservations = [], onTableTap, onTab
           />
         </div>
       )}
+
+      {/* Auto-detect preview modal */}
+      {detection && (
+        <DetectionPreview
+          bgImageUrl={bgImageUrl}
+          detection={detection}
+          applying={applyingDetection}
+          onCancel={() => setDetection(null)}
+          onApply={applyDetection}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Sub-component: detection preview ─────────────────────────
+
+type PreviewSpace = { name: string; zone: string; x: number; y: number; width: number; height: number };
+type PreviewTable = { label: string; x: number; y: number; seats: number; shape: string };
+
+function DetectionPreview({
+  bgImageUrl,
+  detection,
+  applying,
+  onCancel,
+  onApply,
+}: {
+  bgImageUrl: string | null;
+  detection: {
+    spaces: PreviewSpace[];
+    tables: PreviewTable[];
+  };
+  applying: boolean;
+  onCancel: () => void;
+  onApply: (
+    edited: { spaces: PreviewSpace[]; tables: PreviewTable[] },
+    opts: { replaceSpaces: boolean; replaceTables: boolean },
+  ) => void;
+}) {
+  const [replaceSpaces, setReplaceSpaces] = useState(true);
+  const [replaceTables, setReplaceTables] = useState(true);
+  // Editable local copies — user can drag, delete, add tables before confirming
+  const [editSpaces, setEditSpaces] = useState<PreviewSpace[]>(detection.spaces);
+  const [editTables, setEditTables] = useState<PreviewTable[]>(detection.tables);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  function svgCoords(e: React.PointerEvent): { nx: number; ny: number } {
+    const svg = svgRef.current;
+    if (!svg) return { nx: 0, ny: 0 };
+    const rect = svg.getBoundingClientRect();
+    return {
+      nx: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      ny: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+    };
+  }
+
+  function onTableDown(e: React.PointerEvent, idx: number) {
+    e.stopPropagation();
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+    setDragIdx(idx);
+  }
+  function onPointerMove(e: React.PointerEvent) {
+    if (dragIdx === null) return;
+    const { nx, ny } = svgCoords(e);
+    setEditTables((prev) => prev.map((t, i) => (i === dragIdx ? { ...t, x: nx, y: ny } : t)));
+  }
+  function onPointerUp() { setDragIdx(null); }
+
+  function deleteTable(idx: number) {
+    setEditTables((prev) => prev.filter((_, i) => i !== idx));
+    haptic("light");
+  }
+  function addTable() {
+    const n = editTables.length + 1;
+    setEditTables((prev) => [...prev, { label: `T${n}`, x: 0.5, y: 0.5, seats: 4, shape: "round" }]);
+    haptic("light");
+  }
+  function deleteSpace(idx: number) {
+    setEditSpaces((prev) => prev.filter((_, i) => i !== idx));
+    haptic("light");
+  }
+
+  const zoneColor = (z: string) =>
+    z === "terrasse" ? "#D4A04A" :
+    z === "terrasse_couverte" ? "#B89070" :
+    z === "bar" ? "#8B5A40" : "#C4785A";
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      style={{
+        position: "fixed", inset: 0, zIndex: 1000,
+        background: "rgba(0,0,0,0.55)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: 16,
+      }}
+      onClick={onCancel}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "var(--primary-bg)", borderRadius: 16,
+          maxWidth: 720, width: "100%", maxHeight: "92vh",
+          display: "flex", flexDirection: "column", overflow: "hidden",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+        }}
+      >
+        <div style={{ padding: "14px 18px", borderBottom: "1px solid var(--border-color)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Sparkles size={16} style={{ color: "var(--terra-medium)" }} />
+            <strong style={{ fontSize: 15 }}>Détection IA</strong>
+            <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+              {editSpaces.length} espace(s) · {editTables.length} table(s)
+            </span>
+          </div>
+          <button
+            onClick={onCancel}
+            aria-label="Fermer"
+            style={{ background: "transparent", border: "none", cursor: "pointer", padding: 6, borderRadius: 8 }}
+          >
+            <XIcon size={18} />
+          </button>
+        </div>
+
+        <div style={{ padding: 16, overflowY: "auto" }}>
+          {/* Preview canvas */}
+          <div
+            style={{
+              position: "relative",
+              width: "100%",
+              aspectRatio: `${VIEWBOX_W} / ${VIEWBOX_H}`,
+              background: "var(--secondary-bg)",
+              borderRadius: 12,
+              overflow: "hidden",
+              border: "1px solid var(--border-color)",
+            }}
+          >
+            <svg
+              ref={svgRef}
+              viewBox={`0 0 ${VIEWBOX_W} ${VIEWBOX_H}`}
+              width="100%"
+              height="100%"
+              style={{ display: "block", touchAction: "none" }}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerLeave={onPointerUp}
+              onPointerCancel={onPointerUp}
+            >
+              {bgImageUrl && (
+                <image href={bgImageUrl} x={0} y={0} width={VIEWBOX_W} height={VIEWBOX_H} preserveAspectRatio="xMidYMid slice" opacity={0.55} />
+              )}
+              {editSpaces.map((s, i) => (
+                <g key={`sp-${i}`} onClick={() => deleteSpace(i)} style={{ cursor: "pointer" }}>
+                  <rect
+                    x={s.x * VIEWBOX_W}
+                    y={s.y * VIEWBOX_H}
+                    width={s.width * VIEWBOX_W}
+                    height={s.height * VIEWBOX_H}
+                    fill={zoneColor(s.zone)}
+                    fillOpacity={0.18}
+                    stroke={zoneColor(s.zone)}
+                    strokeWidth={3}
+                    rx={10}
+                  />
+                  <text
+                    x={s.x * VIEWBOX_W + 10}
+                    y={s.y * VIEWBOX_H + 24}
+                    fill={zoneColor(s.zone)}
+                    fontSize={18}
+                    fontWeight={700}
+                  >
+                    {s.name}
+                  </text>
+                </g>
+              ))}
+              {editTables.map((t, i) => {
+                const r = Math.max(MIN_TABLE_RADIUS, Math.min(MAX_TABLE_RADIUS, 18 + t.seats * 2));
+                const cx = t.x * VIEWBOX_W;
+                const cy = t.y * VIEWBOX_H;
+                const isDragging = dragIdx === i;
+                return (
+                  <g
+                    key={`t-${i}`}
+                    onPointerDown={(e) => onTableDown(e, i)}
+                    onDoubleClick={() => deleteTable(i)}
+                    style={{ cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
+                  >
+                    <circle
+                      cx={cx}
+                      cy={cy}
+                      r={r}
+                      fill={isDragging ? "var(--terra-medium)" : "#fff"}
+                      stroke="var(--terra-medium)"
+                      strokeWidth={3}
+                    />
+                    <text
+                      x={cx}
+                      y={cy + 4}
+                      textAnchor="middle"
+                      fontSize={13}
+                      fontWeight={700}
+                      fill={isDragging ? "#fff" : "var(--terra-medium)"}
+                      style={{ pointerEvents: "none", userSelect: "none" }}
+                    >
+                      {t.label}
+                    </text>
+                    {/* Delete handle — bottom-right of circle */}
+                    <g
+                      onPointerDown={(e) => { e.stopPropagation(); deleteTable(i); }}
+                      style={{ cursor: "pointer" }}
+                    >
+                      <circle cx={cx + r * 0.75} cy={cy - r * 0.75} r={9} fill="#c44" />
+                      <text x={cx + r * 0.75} y={cy - r * 0.75 + 4} textAnchor="middle" fontSize={12} fontWeight={800} fill="#fff" style={{ pointerEvents: "none", userSelect: "none" }}>×</text>
+                    </g>
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
+
+          <p style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 10, lineHeight: 1.5 }}>
+            Glisse les tables pour ajuster · Tap <span style={{ color: "#c44", fontWeight: 700 }}>×</span> pour supprimer · Tap un espace pour le retirer
+          </p>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button
+              onClick={addTable}
+              style={{
+                display: "flex", alignItems: "center", gap: 4,
+                padding: "8px 12px", borderRadius: 8,
+                background: "var(--secondary-bg)", color: "var(--text-primary)",
+                border: "1px dashed var(--border-color)", cursor: "pointer",
+                fontSize: 12, fontWeight: 500,
+              }}
+            >
+              <Plus size={12} /> Ajouter une table
+            </button>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <input type="checkbox" checked={replaceSpaces} onChange={(e) => setReplaceSpaces(e.target.checked)} />
+              Remplacer les espaces existants
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+              <input type="checkbox" checked={replaceTables} onChange={(e) => setReplaceTables(e.target.checked)} />
+              Remplacer les tables existantes
+            </label>
+          </div>
+        </div>
+
+        <div style={{ padding: 14, borderTop: "1px solid var(--border-color)", display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button
+            onClick={onCancel}
+            disabled={applying}
+            style={{ padding: "10px 16px", borderRadius: 10, background: "var(--secondary-bg)", color: "var(--text-secondary)", border: "none", cursor: "pointer", fontSize: 13, fontWeight: 500 }}
+          >
+            Annuler
+          </button>
+          <button
+            onClick={() => onApply({ spaces: editSpaces, tables: editTables }, { replaceSpaces, replaceTables })}
+            disabled={applying || (editSpaces.length === 0 && editTables.length === 0)}
+            style={{
+              display: "flex", alignItems: "center", gap: 6,
+              padding: "10px 16px", borderRadius: 10,
+              background: "var(--gradient-primary)", color: "#fff", border: "none",
+              cursor: applying ? "default" : "pointer", opacity: applying ? 0.6 : 1,
+              fontSize: 13, fontWeight: 600,
+            }}
+          >
+            {applying ? <><Loader2 size={14} className="animate-spin" /> Import…</> : <><Check size={14} /> Appliquer</>}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
